@@ -162,7 +162,7 @@ class Logger {
     if (context) {
       const { sessionId, sdkSessionId, correlationId, ...rest } = context;
       if (Object.keys(rest).length > 0) {
-        const pairs = Object.entries(rest).map(([k, v]) => `${k}=${v}`);
+        const pairs = Object.entries(rest).map(([k, v]) => `${k}=${this.formatData(v)}`);
         contextStr = ` {${pairs.join(', ')}}`;
       }
     }

@@ -81,6 +81,31 @@ export class ChromaSync {
   }
 
   /**
+   * Reset connection state (call when client dies)
+   */
+  private resetConnection(): void {
+    this.connected = false;
+    this.client = null;
+    logger.debug('CHROMA_SYNC', 'Connection reset', { project: this.project });
+  }
+
+  /**
+   * Check if error is a connection error that requires reconnection
+   */
+  private isConnectionError(error: any): boolean {
+    const errorMessage = error?.message || String(error);
+    const errorCode = error?.code || error?.errno;
+
+    // EPIPE = broken pipe (process died)
+    // ECONNRESET = connection reset by peer
+    return errorCode === 'EPIPE' ||
+           errorCode === 'ECONNRESET' ||
+           errorCode === -32 || // EPIPE errno
+           errorMessage.includes('EPIPE') ||
+           errorMessage.includes('write EPIPE');
+  }
+
+  /**
    * Ensure MCP client is connected to Chroma server
    * Throws error if connection fails
    */
@@ -114,8 +139,47 @@ export class ChromaSync {
 
       logger.info('CHROMA_SYNC', 'Connected to Chroma MCP server', { project: this.project });
     } catch (error) {
+      this.resetConnection(); // Clean up on connection failure
       logger.error('CHROMA_SYNC', 'Failed to connect to Chroma MCP server', { project: this.project }, error as Error);
       throw new Error(`Chroma connection failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Call MCP tool with automatic reconnection on connection errors
+   * Retries once if connection error detected
+   */
+  private async callToolSafe(name: string, args: any): Promise<any> {
+    await this.ensureConnection();
+
+    if (!this.client) {
+      throw new Error('Chroma client not initialized');
+    }
+
+    try {
+      return await this.client.callTool({ name, arguments: args });
+    } catch (error) {
+      // If connection error, reset and retry once
+      if (this.isConnectionError(error)) {
+        logger.warn('CHROMA_SYNC', 'Connection error detected, resetting and retrying', {
+          project: this.project,
+          tool: name,
+          error: error instanceof Error ? error.message : String(error)
+        });
+
+        this.resetConnection();
+        await this.ensureConnection();
+
+        if (!this.client) {
+          throw new Error('Chroma client not initialized after reconnection');
+        }
+
+        // Retry once
+        return await this.client.callTool({ name, arguments: args });
+      }
+
+      // Not a connection error, rethrow
+      throw error;
     }
   }
 
@@ -124,19 +188,10 @@ export class ChromaSync {
    * Throws error if collection creation fails
    */
   private async ensureCollection(): Promise<void> {
-    await this.ensureConnection();
-
-    if (!this.client) {
-      throw new Error('Chroma client not initialized');
-    }
-
     try {
       // Try to get collection info (will fail if doesn't exist)
-      await this.client.callTool({
-        name: 'chroma_get_collection_info',
-        arguments: {
-          collection_name: this.collectionName
-        }
+      await this.callToolSafe('chroma_get_collection_info', {
+        collection_name: this.collectionName
       });
 
       logger.debug('CHROMA_SYNC', 'Collection exists', { collection: this.collectionName });
@@ -145,12 +200,9 @@ export class ChromaSync {
       logger.info('CHROMA_SYNC', 'Creating collection', { collection: this.collectionName });
 
       try {
-        await this.client.callTool({
-          name: 'chroma_create_collection',
-          arguments: {
-            collection_name: this.collectionName,
-            embedding_function_name: 'default'
-          }
+        await this.callToolSafe('chroma_create_collection', {
+          collection_name: this.collectionName,
+          embedding_function_name: 'default'
         });
 
         logger.info('CHROMA_SYNC', 'Collection created', { collection: this.collectionName });
@@ -307,19 +359,12 @@ export class ChromaSync {
 
     await this.ensureCollection();
 
-    if (!this.client) {
-      throw new Error('Chroma client not initialized');
-    }
-
     try {
-      await this.client.callTool({
-        name: 'chroma_add_documents',
-        arguments: {
-          collection_name: this.collectionName,
-          documents: documents.map(d => d.document),
-          ids: documents.map(d => d.id),
-          metadatas: documents.map(d => d.metadata)
-        }
+      await this.callToolSafe('chroma_add_documents', {
+        collection_name: this.collectionName,
+        documents: documents.map(d => d.document),
+        ids: documents.map(d => d.id),
+        metadatas: documents.map(d => d.metadata)
       });
 
       logger.debug('CHROMA_SYNC', 'Documents added', {
@@ -495,15 +540,12 @@ export class ChromaSync {
 
     while (true) {
       try {
-        const result = await this.client.callTool({
-          name: 'chroma_get_documents',
-          arguments: {
-            collection_name: this.collectionName,
-            limit,
-            offset,
-            where: { project: this.project }, // Filter by project
-            include: ['metadatas']
-          }
+        const result = await this.callToolSafe('chroma_get_documents', {
+          collection_name: this.collectionName,
+          limit,
+          offset,
+          where: { project: this.project }, // Filter by project
+          include: ['metadatas']
         });
 
         const data = result.content[0];

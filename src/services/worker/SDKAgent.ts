@@ -64,7 +64,10 @@ export class SDKAgent {
           disallowedTools,
           abortController: session.abortController,
           pathToClaudeCodeExecutable: claudePath,
-          env: this.getSDKEnv(),
+          env: {
+            ...process.env,
+            ...this.getSDKEnv(),
+          },
         },
       });
 
@@ -256,7 +259,11 @@ export class SDKAgent {
         });
       }
 
-      logger.info("SDK", "Observation saved", { obsId, type: obs.type, model: modelId });
+      logger.info("SDK", "Observation saved", {
+        obsId,
+        type: obs.type,
+        model: modelId,
+      });
     }
 
     // Parse summary
@@ -359,9 +366,16 @@ export class SDKAgent {
 
   /**
    * Get SDK environment variables from settings or environment
+   * Preserves PATH and other essential env vars for subprocess
    */
   private getSDKEnv(): Record<string, string> {
-    const env: Record<string, string> = {};
+    // Start with essential environment variables that subprocess needs
+    const env: Record<string, string> = {
+      PATH: process.env.PATH || "",
+      HOME: process.env.HOME || homedir(),
+      USER: process.env.USER || "",
+      SHELL: process.env.SHELL || "",
+    };
 
     try {
       const settingsPath = path.join(homedir(), ".claude-mem", "settings.json");
@@ -370,11 +384,11 @@ export class SDKAgent {
 
         // Read each SDK env var from settings
         const envKeys = [
-          'ANTHROPIC_AUTH_TOKEN',
-          'ANTHROPIC_BASE_URL',
-          'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-          'ANTHROPIC_DEFAULT_SONNET_MODEL',
-          'ANTHROPIC_DEFAULT_OPUS_MODEL'
+          "ANTHROPIC_AUTH_TOKEN",
+          "ANTHROPIC_BASE_URL",
+          "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+          "ANTHROPIC_DEFAULT_SONNET_MODEL",
+          "ANTHROPIC_DEFAULT_OPUS_MODEL",
         ];
 
         for (const key of envKeys) {
@@ -387,13 +401,24 @@ export class SDKAgent {
       // Fall through to process.env
     }
 
-    // Fallback to process.env for any missing values
-    return {
-      ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN || '',
-      ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL || '',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: env.ANTHROPIC_DEFAULT_HAIKU_MODEL || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || '',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: env.ANTHROPIC_DEFAULT_SONNET_MODEL || process.env.ANTHROPIC_DEFAULT_SONNET_MODEL || '',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: env.ANTHROPIC_DEFAULT_OPUS_MODEL || process.env.ANTHROPIC_DEFAULT_OPUS_MODEL || ''
-    };
+    // Fallback to process.env for any missing Anthropic values
+    env.ANTHROPIC_AUTH_TOKEN =
+      env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN || "";
+    env.ANTHROPIC_BASE_URL =
+      env.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL =
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
+      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
+      "";
+    env.ANTHROPIC_DEFAULT_SONNET_MODEL =
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
+      "";
+    env.ANTHROPIC_DEFAULT_OPUS_MODEL =
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
+      "";
+
+    return env;
   }
 }
