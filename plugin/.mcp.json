@@ -2,7 +2,13 @@
   "mcpServers": {
     "claude-mem-search": {
       "type": "stdio",
-      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/search-server.mjs"
+      "command": "mise",
+      "args": [
+        "x",
+        "node@22.19.0",
+        "--",
+        "${CLAUDE_PLUGIN_ROOT}/scripts/search-server.mjs"
+      ]
     }
   }
 }
