@@ -8,20 +8,28 @@
  * - Sync to database and Chroma
  */
 
-import { execSync } from 'child_process';
-import { homedir } from 'os';
-import path from 'path';
-import { existsSync, readFileSync } from 'fs';
-import { DatabaseManager } from './DatabaseManager.js';
-import { SessionManager } from './SessionManager.js';
-import { logger } from '../../utils/logger.js';
-import { parseObservations, parseSummary } from '../../sdk/parser.js';
-import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt } from '../../sdk/prompts.js';
-import type { ActiveSession, SDKUserMessage, PendingMessage } from '../worker-types.js';
+import { execSync } from "child_process";
+import { homedir } from "os";
+import path from "path";
+import { existsSync, readFileSync } from "fs";
+import { DatabaseManager } from "./DatabaseManager.js";
+import { SessionManager } from "./SessionManager.js";
+import { logger } from "../../utils/logger.js";
+import { parseObservations, parseSummary } from "../../sdk/parser.js";
+import {
+  buildInitPrompt,
+  buildObservationPrompt,
+  buildSummaryPrompt,
+} from "../../sdk/prompts.js";
+import type {
+  ActiveSession,
+  SDKUserMessage,
+  PendingMessage,
+} from "../worker-types.js";
 
 // Import Agent SDK (assumes it's installed)
 // @ts-ignore - Agent SDK types may not be available
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query } from "@anthropic-ai/claude-agent-sdk";
 
 export class SDKAgent {
   private dbManager: DatabaseManager;
@@ -43,7 +51,7 @@ export class SDKAgent {
 
       // Get model ID and disallowed tools
       const modelId = this.getModelId();
-      const disallowedTools = ['Bash']; // Prevent infinite loops
+      const disallowedTools = ["Bash"]; // Prevent infinite loops
 
       // Create message generator (event-driven)
       const messageGenerator = this.createMessageGenerator(session);
@@ -55,23 +63,29 @@ export class SDKAgent {
           model: modelId,
           disallowedTools,
           abortController: session.abortController,
-          pathToClaudeCodeExecutable: claudePath
-        }
+          pathToClaudeCodeExecutable: claudePath,
+          env: this.getSDKEnv(),
+        },
       });
 
       // Process SDK messages
       for await (const message of queryResult) {
         // Handle assistant messages
-        if (message.type === 'assistant') {
+        if (message.type === "assistant") {
           const content = message.message.content;
           const textContent = Array.isArray(content)
-            ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
-            : typeof content === 'string' ? content : '';
+            ? content
+                .filter((c: any) => c.type === "text")
+                .map((c: any) => c.text)
+                .join("\n")
+            : typeof content === "string"
+              ? content
+              : "";
 
           const responseSize = textContent.length;
-          logger.dataOut('SDK', `Response received (${responseSize} chars)`, {
+          logger.dataOut("SDK", `Response received (${responseSize} chars)`, {
             sessionId: session.sessionDbId,
-            promptNumber: session.lastPromptNumber
+            promptNumber: session.lastPromptNumber,
           });
 
           // Parse and process response
@@ -79,25 +93,31 @@ export class SDKAgent {
         }
 
         // Log result messages
-        if (message.type === 'result' && message.subtype === 'success') {
+        if (message.type === "result" && message.subtype === "success") {
           // Usage telemetry is captured at SDK level
         }
       }
 
       // Mark session complete
       const sessionDuration = Date.now() - session.startTime;
-      logger.success('SDK', 'Agent completed', {
+      logger.success("SDK", "Agent completed", {
         sessionId: session.sessionDbId,
-        duration: `${(sessionDuration / 1000).toFixed(1)}s`
+        duration: `${(sessionDuration / 1000).toFixed(1)}s`,
       });
 
-      this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
-
+      this.dbManager
+        .getSessionStore()
+        .markSessionCompleted(session.sessionDbId);
     } catch (error: any) {
-      if (error.name === 'AbortError') {
-        logger.warn('SDK', 'Agent aborted', { sessionId: session.sessionDbId });
+      if (error.name === "AbortError") {
+        logger.warn("SDK", "Agent aborted", { sessionId: session.sessionDbId });
       } else {
-        logger.failure('SDK', 'Agent error', { sessionDbId: session.sessionDbId }, error);
+        logger.failure(
+          "SDK",
+          "Agent error",
+          { sessionDbId: session.sessionDbId },
+          error,
+        );
       }
       throw error;
     } finally {
@@ -109,58 +129,66 @@ export class SDKAgent {
   /**
    * Create event-driven message generator (yields messages from SessionManager)
    */
-  private async *createMessageGenerator(session: ActiveSession): AsyncIterableIterator<SDKUserMessage> {
+  private async *createMessageGenerator(
+    session: ActiveSession,
+  ): AsyncIterableIterator<SDKUserMessage> {
     // Yield initial user prompt with context
     yield {
-      type: 'user',
+      type: "user",
       message: {
-        role: 'user',
-        content: buildInitPrompt(session.project, session.claudeSessionId, session.userPrompt)
+        role: "user",
+        content: buildInitPrompt(
+          session.project,
+          session.claudeSessionId,
+          session.userPrompt,
+        ),
       },
       session_id: session.claudeSessionId,
       parent_tool_use_id: null,
-      isSynthetic: true
+      isSynthetic: true,
     };
 
     // Consume pending messages from SessionManager (event-driven, no polling)
-    for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
-      if (message.type === 'observation') {
+    for await (const message of this.sessionManager.getMessageIterator(
+      session.sessionDbId,
+    )) {
+      if (message.type === "observation") {
         // Update last prompt number
         if (message.prompt_number !== undefined) {
           session.lastPromptNumber = message.prompt_number;
         }
 
         yield {
-          type: 'user',
+          type: "user",
           message: {
-            role: 'user',
+            role: "user",
             content: buildObservationPrompt({
               id: 0, // Not used in prompt
               tool_name: message.tool_name!,
               tool_input: JSON.stringify(message.tool_input),
               tool_output: JSON.stringify(message.tool_response),
-              created_at_epoch: Date.now()
-            })
+              created_at_epoch: Date.now(),
+            }),
           },
           session_id: session.claudeSessionId,
           parent_tool_use_id: null,
-          isSynthetic: true
+          isSynthetic: true,
         };
-      } else if (message.type === 'summarize') {
+      } else if (message.type === "summarize") {
         yield {
-          type: 'user',
+          type: "user",
           message: {
-            role: 'user',
+            role: "user",
             content: buildSummaryPrompt({
               id: session.sessionDbId,
               sdk_session_id: session.sdkSessionId,
               project: session.project,
-              user_prompt: session.userPrompt
-            })
+              user_prompt: session.userPrompt,
+            }),
           },
           session_id: session.claudeSessionId,
           parent_tool_use_id: null,
-          isSynthetic: true
+          isSynthetic: true,
         };
       }
     }
@@ -169,33 +197,42 @@ export class SDKAgent {
   /**
    * Process SDK response text (parse XML, save to database, sync to Chroma)
    */
-  private async processSDKResponse(session: ActiveSession, text: string, worker?: any): Promise<void> {
+  private async processSDKResponse(
+    session: ActiveSession,
+    text: string,
+    worker?: any,
+  ): Promise<void> {
     // Parse observations
     const observations = parseObservations(text, session.claudeSessionId);
 
     // Store observations
     for (const obs of observations) {
-      const { id: obsId, createdAtEpoch } = this.dbManager.getSessionStore().storeObservation(
-        session.claudeSessionId,
-        session.project,
-        obs,
-        session.lastPromptNumber
-      );
+      const { id: obsId, createdAtEpoch } = this.dbManager
+        .getSessionStore()
+        .storeObservation(
+          session.claudeSessionId,
+          session.project,
+          obs,
+          session.lastPromptNumber,
+        );
 
       // Sync to Chroma (fire-and-forget)
-      this.dbManager.getChromaSync().syncObservation(
-        obsId,
-        session.claudeSessionId,
-        session.project,
-        obs,
-        session.lastPromptNumber,
-        createdAtEpoch
-      ).catch(() => {});
+      this.dbManager
+        .getChromaSync()
+        .syncObservation(
+          obsId,
+          session.claudeSessionId,
+          session.project,
+          obs,
+          session.lastPromptNumber,
+          createdAtEpoch,
+        )
+        .catch(() => {});
 
       // Broadcast to SSE clients (for web UI)
       if (worker && worker.sseBroadcaster) {
         worker.sseBroadcaster.broadcast({
-          type: 'new_observation',
+          type: "new_observation",
           observation: {
             id: obsId,
             sdk_session_id: session.sdkSessionId,
@@ -211,12 +248,12 @@ export class SDKAgent {
             files_modified: JSON.stringify([]),
             project: session.project,
             prompt_number: session.lastPromptNumber,
-            created_at_epoch: createdAtEpoch
-          }
+            created_at_epoch: createdAtEpoch,
+          },
         });
       }
 
-      logger.info('SDK', 'Observation saved', { obsId, type: obs.type });
+      logger.info("SDK", "Observation saved", { obsId, type: obs.type });
     }
 
     // Parse summary
@@ -224,27 +261,32 @@ export class SDKAgent {
 
     // Store summary
     if (summary) {
-      const { id: summaryId, createdAtEpoch } = this.dbManager.getSessionStore().storeSummary(
-        session.claudeSessionId,
-        session.project,
-        summary,
-        session.lastPromptNumber
-      );
+      const { id: summaryId, createdAtEpoch } = this.dbManager
+        .getSessionStore()
+        .storeSummary(
+          session.claudeSessionId,
+          session.project,
+          summary,
+          session.lastPromptNumber,
+        );
 
       // Sync to Chroma (fire-and-forget)
-      this.dbManager.getChromaSync().syncSummary(
-        summaryId,
-        session.claudeSessionId,
-        session.project,
-        summary,
-        session.lastPromptNumber,
-        createdAtEpoch
-      ).catch(() => {});
+      this.dbManager
+        .getChromaSync()
+        .syncSummary(
+          summaryId,
+          session.claudeSessionId,
+          session.project,
+          summary,
+          session.lastPromptNumber,
+          createdAtEpoch,
+        )
+        .catch(() => {});
 
       // Broadcast to SSE clients (for web UI)
       if (worker && worker.sseBroadcaster) {
         worker.sseBroadcaster.broadcast({
-          type: 'new_summary',
+          type: "new_summary",
           summary: {
             id: summaryId,
             session_id: session.claudeSessionId,
@@ -256,16 +298,16 @@ export class SDKAgent {
             notes: summary.notes,
             project: session.project,
             prompt_number: session.lastPromptNumber,
-            created_at_epoch: createdAtEpoch
-          }
+            created_at_epoch: createdAtEpoch,
+          },
         });
       }
 
-      logger.info('SDK', 'Summary saved', { summaryId });
+      logger.info("SDK", "Summary saved", { summaryId });
     }
 
     // Check and stop spinner after processing (debounced)
-    if (worker && typeof worker.checkAndStopSpinner === 'function') {
+    if (worker && typeof worker.checkAndStopSpinner === "function") {
       worker.checkAndStopSpinner();
     }
   }
@@ -278,12 +320,17 @@ export class SDKAgent {
    * Find Claude executable (inline, called once per session)
    */
   private findClaudeExecutable(): string {
-    const claudePath = process.env.CLAUDE_CODE_PATH ||
-      execSync(process.platform === 'win32' ? 'where claude' : 'which claude', { encoding: 'utf8' })
-        .trim().split('\n')[0].trim();
+    const claudePath =
+      process.env.CLAUDE_CODE_PATH ||
+      execSync(process.platform === "win32" ? "where claude" : "which claude", {
+        encoding: "utf8",
+      })
+        .trim()
+        .split("\n")[0]
+        .trim();
 
     if (!claudePath) {
-      throw new Error('Claude executable not found in PATH');
+      throw new Error("Claude executable not found in PATH");
     }
 
     return claudePath;
@@ -294,9 +341,9 @@ export class SDKAgent {
    */
   private getModelId(): string {
     try {
-      const settingsPath = path.join(homedir(), '.claude-mem', 'settings.json');
+      const settingsPath = path.join(homedir(), ".claude-mem", "settings.json");
       if (existsSync(settingsPath)) {
-        const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
         const modelId = settings.env?.CLAUDE_MEM_MODEL;
         if (modelId) return modelId;
       }
@@ -304,6 +351,46 @@ export class SDKAgent {
       // Fall through to env var or default
     }
 
-    return process.env.CLAUDE_MEM_MODEL || 'claude-haiku-4-5';
+    return process.env.CLAUDE_MEM_MODEL || "claude-haiku-4-5";
+  }
+
+  /**
+   * Get SDK environment variables from settings or environment
+   */
+  private getSDKEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+
+    try {
+      const settingsPath = path.join(homedir(), ".claude-mem", "settings.json");
+      if (existsSync(settingsPath)) {
+        const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+
+        // Read each SDK env var from settings
+        const envKeys = [
+          'ANTHROPIC_AUTH_TOKEN',
+          'ANTHROPIC_BASE_URL',
+          'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+          'ANTHROPIC_DEFAULT_SONNET_MODEL',
+          'ANTHROPIC_DEFAULT_OPUS_MODEL'
+        ];
+
+        for (const key of envKeys) {
+          if (settings.env?.[key]) {
+            env[key] = settings.env[key];
+          }
+        }
+      }
+    } catch {
+      // Fall through to process.env
+    }
+
+    // Fallback to process.env for any missing values
+    return {
+      ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN || '',
+      ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL || '',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: env.ANTHROPIC_DEFAULT_HAIKU_MODEL || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || '',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: env.ANTHROPIC_DEFAULT_SONNET_MODEL || process.env.ANTHROPIC_DEFAULT_SONNET_MODEL || '',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: env.ANTHROPIC_DEFAULT_OPUS_MODEL || process.env.ANTHROPIC_DEFAULT_OPUS_MODEL || ''
+    };
   }
 }
