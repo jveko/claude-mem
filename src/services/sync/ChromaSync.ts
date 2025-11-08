@@ -539,8 +539,13 @@ export class ChromaSync {
           batchSize: metadatas.length
         });
       } catch (error) {
-        logger.error('CHROMA_SYNC', 'Failed to fetch existing IDs', { project: this.project }, error as Error);
-        throw error;
+        // Transient error (e.g., MCP server not fully initialized) - fall back to empty sets
+        // This is safe: worst case we re-add existing documents (Chroma uses upsert semantics)
+        logger.warn('CHROMA_SYNC', 'Failed to fetch existing IDs, falling back to full backfill', {
+          project: this.project,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        break; // Exit pagination loop, return empty sets
       }
     }
 
