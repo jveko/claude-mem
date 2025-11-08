@@ -40,6 +40,10 @@ export class DatabaseManager {
    * Close database connection
    */
   async close(): Promise<void> {
+    if (this.chromaSync) {
+      await this.chromaSync.close();
+      this.chromaSync = null;
+    }
     if (this.sessionStore) {
       this.sessionStore.close();
       this.sessionStore = null;
