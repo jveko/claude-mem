@@ -86,10 +86,11 @@ export class SDKAgent {
           logger.dataOut("SDK", `Response received (${responseSize} chars)`, {
             sessionId: session.sessionDbId,
             promptNumber: session.lastPromptNumber,
+            model: modelId,
           });
 
           // Parse and process response
-          await this.processSDKResponse(session, textContent, worker);
+          await this.processSDKResponse(session, textContent, modelId, worker);
         }
 
         // Log result messages
@@ -103,6 +104,7 @@ export class SDKAgent {
       logger.success("SDK", "Agent completed", {
         sessionId: session.sessionDbId,
         duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+        model: modelId,
       });
 
       this.dbManager
@@ -200,6 +202,7 @@ export class SDKAgent {
   private async processSDKResponse(
     session: ActiveSession,
     text: string,
+    modelId: string,
     worker?: any,
   ): Promise<void> {
     // Parse observations
@@ -253,7 +256,7 @@ export class SDKAgent {
         });
       }
 
-      logger.info("SDK", "Observation saved", { obsId, type: obs.type });
+      logger.info("SDK", "Observation saved", { obsId, type: obs.type, model: modelId });
     }
 
     // Parse summary
@@ -303,7 +306,7 @@ export class SDKAgent {
         });
       }
 
-      logger.info("SDK", "Summary saved", { summaryId });
+      logger.info("SDK", "Summary saved", { summaryId, model: modelId });
     }
 
     // Check and stop spinner after processing (debounced)
