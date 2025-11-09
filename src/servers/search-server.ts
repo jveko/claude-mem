@@ -115,8 +115,8 @@ Search workflow:
 4. Narrow down: Use filters (type, dateRange, concepts, files) to refine results
 
 Other tips:
-• To search by concept: Use find_by_concept tool
-• To browse by type: Use find_by_type with ["decision", "feature", etc.]
+• To browse by metadata: Omit query parameter and use type/concepts/files filters
+• To search files: Use find_by_file tool (returns observations + sessions)
 • To sort by date: Use orderBy: "date_desc" or "date_asc"`;
 }
 
@@ -346,9 +346,9 @@ const filterSchema = z.object({
 const tools = [
   {
     name: 'search_observations',
-    description: 'Search observations using full-text search across titles, narratives, facts, and concepts. IMPORTANT: Always use index format first (default) to get an overview with minimal token usage, then use format: "full" only for specific items of interest.',
+    description: 'Search observations using full-text search across titles, narratives, facts, and concepts. If query is omitted, returns all observations matching the provided filters (type, concepts, files, dateRange). IMPORTANT: Always use index format first (default) to get an overview with minimal token usage, then use format: "full" only for specific items of interest.',
     inputSchema: z.object({
-      query: z.string().describe('Search query for FTS5 full-text search'),
+      query: z.string().optional().describe('Search query for FTS5 full-text search. If omitted, returns all observations matching filters (useful for browsing by type, concept, etc.)'),
       format: z.enum(['index', 'full']).default('index').describe('Output format: "index" for titles/dates only (default, RECOMMENDED for initial search), "full" for complete details (use only after reviewing index results)'),
       ...filterSchema.shape
     }),
@@ -357,49 +357,66 @@ const tools = [
         const { query, format = 'index', ...options } = args;
         let results: ObservationSearchResult[] = [];
 
-        // Hybrid search: Try Chroma semantic search first, fall back to FTS5
-        if (chromaClient) {
-          try {
-            console.error('[search-server] Using hybrid semantic search (Chroma + SQLite)');
+        // Query-less mode: Pure metadata filtering (replaces find_by_concept, find_by_type)
+        if (!query) {
+          console.error('[search-server] Query-less search: using metadata filters only');
 
-            // Step 1: Chroma semantic search (top 100)
-            const chromaResults = await queryChroma(query, 100);
-            console.error(`[search-server] Chroma returned ${chromaResults.ids.length} semantic matches`);
+          // Use SessionSearch filtering methods based on what filters are provided
+          if (options.concepts) {
+            const concept = Array.isArray(options.concepts) ? options.concepts[0] : options.concepts;
+            results = search.findByConcept(concept, options);
+          } else if (options.type) {
+            results = search.findByType(options.type, options);
+          } else {
+            // No specific filter - return recent observations
+            results = search.searchObservations('', { ...options, orderBy: 'date_desc' });
+          }
+        } else {
+          // Query provided: Hybrid search (Chroma semantic + FTS5 fallback)
+          if (chromaClient) {
+            try {
+              console.error('[search-server] Using hybrid semantic search (Chroma + SQLite)');
 
-            if (chromaResults.ids.length > 0) {
-              // Step 2: Filter by recency (90 days)
-              const ninetyDaysAgo = Date.now() - (90 * 24 * 60 * 60 * 1000);
-              const recentIds = chromaResults.ids.filter((_id, idx) => {
-                const meta = chromaResults.metadatas[idx];
-                return meta && meta.created_at_epoch > ninetyDaysAgo;
-              });
+              // Step 1: Chroma semantic search (top 100)
+              const chromaResults = await queryChroma(query, 100);
+              console.error(`[search-server] Chroma returned ${chromaResults.ids.length} semantic matches`);
 
-              console.error(`[search-server] ${recentIds.length} results within 90-day window`);
+              if (chromaResults.ids.length > 0) {
+                // Step 2: Filter by recency (90 days)
+                const ninetyDaysAgo = Date.now() - (90 * 24 * 60 * 60 * 1000);
+                const recentIds = chromaResults.ids.filter((_id, idx) => {
+                  const meta = chromaResults.metadatas[idx];
+                  return meta && meta.created_at_epoch > ninetyDaysAgo;
+                });
 
-              // Step 3: Hydrate from SQLite in temporal order
-              if (recentIds.length > 0) {
-                const limit = options.limit || 20;
-                results = store.getObservationsByIds(recentIds, { orderBy: 'date_desc', limit });
-                console.error(`[search-server] Hydrated ${results.length} observations from SQLite`);
+                console.error(`[search-server] ${recentIds.length} results within 90-day window`);
+
+                // Step 3: Hydrate from SQLite in temporal order
+                if (recentIds.length > 0) {
+                  const limit = options.limit || 20;
+                  results = store.getObservationsByIds(recentIds, { orderBy: 'date_desc', limit });
+                  console.error(`[search-server] Hydrated ${results.length} observations from SQLite`);
+                }
               }
+            } catch (chromaError: any) {
+              console.error('[search-server] Chroma query failed, falling back to FTS5:', chromaError.message);
+              // Fall through to FTS5 fallback
             }
-          } catch (chromaError: any) {
-            console.error('[search-server] Chroma query failed, falling back to FTS5:', chromaError.message);
-            // Fall through to FTS5 fallback
+          }
+
+          // Fall back to FTS5 if Chroma unavailable or returned no results
+          if (results.length === 0) {
+            console.error('[search-server] Using FTS5 keyword search');
+            results = search.searchObservations(query, options);
           }
         }
 
-        // Fall back to FTS5 if Chroma unavailable or returned no results
         if (results.length === 0) {
-          console.error('[search-server] Using FTS5 keyword search');
-          results = search.searchObservations(query, options);
-        }
-
-        if (results.length === 0) {
+          const queryText = query ? `matching "${query}"` : 'matching filters';
           return {
             content: [{
               type: 'text' as const,
-              text: `No observations found matching "${query}"`
+              text: `No observations found ${queryText}`
             }]
           };
         }
@@ -407,7 +424,8 @@ const tools = [
         // Format based on requested format
         let combinedText: string;
         if (format === 'index') {
-          const header = `Found ${results.length} observation(s) matching "${query}":\n\n`;
+          const queryText = query ? `matching "${query}"` : 'matching filters';
+          const header = `Found ${results.length} observation(s) ${queryText}:\n\n`;
           const formattedResults = results.map((obs, i) => formatObservationIndex(obs, i));
           combinedText = header + formattedResults.join('\n\n') + formatSearchTips();
         } else {
@@ -506,106 +524,6 @@ const tools = [
           combinedText = header + formattedResults.join('\n\n') + formatSearchTips();
         } else {
           const formattedResults = results.map((session) => formatSessionResult(session));
-          combinedText = formattedResults.join('\n\n---\n\n');
-        }
-
-        return {
-          content: [{
-            type: 'text' as const,
-            text: combinedText
-          }]
-        };
-      } catch (error: any) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: `Search failed: ${error.message}`
-          }],
-          isError: true
-        };
-      }
-    }
-  },
-  {
-    name: 'find_by_concept',
-    description: 'Find observations tagged with a specific concept. Available concepts: "discovery", "problem-solution", "what-changed", "how-it-works", "pattern", "gotcha", "change". IMPORTANT: Always use index format first (default) to get an overview with minimal token usage, then use format: "full" only for specific items of interest.',
-    inputSchema: z.object({
-      concept: z.string().describe('Concept tag to search for. Available: discovery, problem-solution, what-changed, how-it-works, pattern, gotcha, change'),
-      format: z.enum(['index', 'full']).default('index').describe('Output format: "index" for titles/dates only (default, RECOMMENDED for initial search), "full" for complete details (use only after reviewing index results)'),
-      project: z.string().optional().describe('Filter by project name'),
-      dateRange: z.object({
-        start: z.union([z.string(), z.number()]).optional(),
-        end: z.union([z.string(), z.number()]).optional()
-      }).optional().describe('Filter by date range'),
-      limit: z.number().min(1).max(100).default(20).describe('Maximum results. IMPORTANT: Start with 3-5 to avoid exceeding MCP token limits, even in index mode.'),
-      offset: z.number().min(0).default(0).describe('Number of results to skip'),
-      orderBy: z.enum(['relevance', 'date_desc', 'date_asc']).default('date_desc').describe('Sort order')
-    }),
-    handler: async (args: any) => {
-      try {
-        const { concept, format = 'index', ...filters } = args;
-        let results: ObservationSearchResult[] = [];
-
-        // Metadata-first, semantic-enhanced search
-        if (chromaClient) {
-          try {
-            console.error('[search-server] Using metadata-first + semantic ranking for concept search');
-
-            // Step 1: SQLite metadata filter (get all IDs with this concept)
-            const metadataResults = search.findByConcept(concept, filters);
-            console.error(`[search-server] Found ${metadataResults.length} observations with concept "${concept}"`);
-
-            if (metadataResults.length > 0) {
-              // Step 2: Chroma semantic ranking (rank by relevance to concept)
-              const ids = metadataResults.map(obs => obs.id);
-              const chromaResults = await queryChroma(concept, Math.min(ids.length, 100));
-
-              // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-              const rankedIds: number[] = [];
-              for (const chromaId of chromaResults.ids) {
-                if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-                  rankedIds.push(chromaId);
-                }
-              }
-
-              console.error(`[search-server] Chroma ranked ${rankedIds.length} results by semantic relevance`);
-
-              // Step 3: Hydrate in semantic rank order
-              if (rankedIds.length > 0) {
-                results = store.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-                // Restore semantic ranking order
-                results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
-              }
-            }
-          } catch (chromaError: any) {
-            console.error('[search-server] Chroma ranking failed, using SQLite order:', chromaError.message);
-            // Fall through to SQLite fallback
-          }
-        }
-
-        // Fall back to SQLite-only if Chroma unavailable or failed
-        if (results.length === 0) {
-          console.error('[search-server] Using SQLite-only concept search');
-          results = search.findByConcept(concept, filters);
-        }
-
-        if (results.length === 0) {
-          return {
-            content: [{
-              type: 'text' as const,
-              text: `No observations found with concept "${concept}"`
-            }]
-          };
-        }
-
-        // Format based on requested format
-        let combinedText: string;
-        if (format === 'index') {
-          const header = `Found ${results.length} observation(s) with concept "${concept}":\n\n`;
-          const formattedResults = results.map((obs, i) => formatObservationIndex(obs, i));
-          combinedText = header + formattedResults.join('\n\n') + formatSearchTips();
-        } else {
-          const formattedResults = results.map((obs) => formatObservationResult(obs));
           combinedText = formattedResults.join('\n\n---\n\n');
         }
 
@@ -736,110 +654,6 @@ const tools = [
             formattedResults.push(formatSessionResult(session));
           });
 
-          combinedText = formattedResults.join('\n\n---\n\n');
-        }
-
-        return {
-          content: [{
-            type: 'text' as const,
-            text: combinedText
-          }]
-        };
-      } catch (error: any) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: `Search failed: ${error.message}`
-          }],
-          isError: true
-        };
-      }
-    }
-  },
-  {
-    name: 'find_by_type',
-    description: 'Find observations of a specific type (decision, bugfix, feature, refactor, discovery, change). IMPORTANT: Always use index format first (default) to get an overview with minimal token usage, then use format: "full" only for specific items of interest.',
-    inputSchema: z.object({
-      type: z.union([
-        z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']),
-        z.array(z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']))
-      ]).describe('Observation type(s) to filter by'),
-      format: z.enum(['index', 'full']).default('index').describe('Output format: "index" for titles/dates only (default, RECOMMENDED for initial search), "full" for complete details (use only after reviewing index results)'),
-      project: z.string().optional().describe('Filter by project name'),
-      dateRange: z.object({
-        start: z.union([z.string(), z.number()]).optional(),
-        end: z.union([z.string(), z.number()]).optional()
-      }).optional().describe('Filter by date range'),
-      limit: z.number().min(1).max(100).default(20).describe('Maximum results. IMPORTANT: Start with 3-5 to avoid exceeding MCP token limits, even in index mode.'),
-      offset: z.number().min(0).default(0).describe('Number of results to skip'),
-      orderBy: z.enum(['relevance', 'date_desc', 'date_asc']).default('date_desc').describe('Sort order')
-    }),
-    handler: async (args: any) => {
-      try {
-        const { type, format = 'index', ...filters } = args;
-        const typeStr = Array.isArray(type) ? type.join(', ') : type;
-        let results: ObservationSearchResult[] = [];
-
-        // Metadata-first, semantic-enhanced search
-        if (chromaClient) {
-          try {
-            console.error('[search-server] Using metadata-first + semantic ranking for type search');
-
-            // Step 1: SQLite metadata filter (get all IDs with this type)
-            const metadataResults = search.findByType(type, filters);
-            console.error(`[search-server] Found ${metadataResults.length} observations with type "${typeStr}"`);
-
-            if (metadataResults.length > 0) {
-              // Step 2: Chroma semantic ranking (rank by relevance to type)
-              const ids = metadataResults.map(obs => obs.id);
-              const chromaResults = await queryChroma(typeStr, Math.min(ids.length, 100));
-
-              // Intersect: Keep only IDs that passed metadata filter, in semantic rank order
-              const rankedIds: number[] = [];
-              for (const chromaId of chromaResults.ids) {
-                if (ids.includes(chromaId) && !rankedIds.includes(chromaId)) {
-                  rankedIds.push(chromaId);
-                }
-              }
-
-              console.error(`[search-server] Chroma ranked ${rankedIds.length} results by semantic relevance`);
-
-              // Step 3: Hydrate in semantic rank order
-              if (rankedIds.length > 0) {
-                results = store.getObservationsByIds(rankedIds, { limit: filters.limit || 20 });
-                // Restore semantic ranking order
-                results.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
-              }
-            }
-          } catch (chromaError: any) {
-            console.error('[search-server] Chroma ranking failed, using SQLite order:', chromaError.message);
-            // Fall through to SQLite fallback
-          }
-        }
-
-        // Fall back to SQLite-only if Chroma unavailable or failed
-        if (results.length === 0) {
-          console.error('[search-server] Using SQLite-only type search');
-          results = search.findByType(type, filters);
-        }
-
-        if (results.length === 0) {
-          return {
-            content: [{
-              type: 'text' as const,
-              text: `No observations found with type "${typeStr}"`
-            }]
-          };
-        }
-
-        // Format based on requested format
-        let combinedText: string;
-        if (format === 'index') {
-          const header = `Found ${results.length} observation(s) with type "${typeStr}":\n\n`;
-          const formattedResults = results.map((obs, i) => formatObservationIndex(obs, i));
-          combinedText = header + formattedResults.join('\n\n') + formatSearchTips();
-        } else {
-          const formattedResults = results.map((obs) => formatObservationResult(obs));
           combinedText = formattedResults.join('\n\n---\n\n');
         }
 
