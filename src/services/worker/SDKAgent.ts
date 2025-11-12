@@ -8,28 +8,20 @@
  * - Sync to database and Chroma
  */
 
-import { execSync } from "child_process";
-import { homedir } from "os";
-import path from "path";
-import { existsSync, readFileSync } from "fs";
-import { DatabaseManager } from "./DatabaseManager.js";
-import { SessionManager } from "./SessionManager.js";
-import { logger } from "../../utils/logger.js";
-import { parseObservations, parseSummary } from "../../sdk/parser.js";
-import {
-  buildInitPrompt,
-  buildObservationPrompt,
-  buildSummaryPrompt,
-} from "../../sdk/prompts.js";
-import type {
-  ActiveSession,
-  SDKUserMessage,
-  PendingMessage,
-} from "../worker-types.js";
+import { execSync } from 'child_process';
+import { homedir } from 'os';
+import path from 'path';
+import { existsSync, readFileSync } from 'fs';
+import { DatabaseManager } from './DatabaseManager.js';
+import { SessionManager } from './SessionManager.js';
+import { logger } from '../../utils/logger.js';
+import { parseObservations, parseSummary } from '../../sdk/parser.js';
+import { buildInitPrompt, buildObservationPrompt, buildSummaryPrompt, buildContinuationPrompt } from '../../sdk/prompts.js';
+import type { ActiveSession, SDKUserMessage, PendingMessage } from '../worker-types.js';
 
 // Import Agent SDK (assumes it's installed)
 // @ts-ignore - Agent SDK types may not be available
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query } from '@anthropic-ai/claude-agent-sdk';
 
 export class SDKAgent {
   private dbManager: DatabaseManager;
@@ -51,7 +43,7 @@ export class SDKAgent {
 
       // Get model ID and disallowed tools
       const modelId = this.getModelId();
-      const disallowedTools = ["Bash"]; // Prevent infinite loops
+      const disallowedTools = ['Bash']; // Prevent infinite loops
 
       // Create message generator (event-driven)
       const messageGenerator = this.createMessageGenerator(session);
@@ -63,70 +55,56 @@ export class SDKAgent {
           model: modelId,
           disallowedTools,
           abortController: session.abortController,
-          pathToClaudeCodeExecutable: claudePath,
-          env: {
-            ...process.env,
-            ...this.getSDKEnv(),
-          },
-        },
+          pathToClaudeCodeExecutable: claudePath
+        }
       });
 
       // Process SDK messages
       for await (const message of queryResult) {
         // Handle assistant messages
-        if (message.type === "assistant") {
+        if (message.type === 'assistant') {
           const content = message.message.content;
           const textContent = Array.isArray(content)
-            ? content
-                .filter((c: any) => c.type === "text")
-                .map((c: any) => c.text)
-                .join("\n")
-            : typeof content === "string"
-              ? content
-              : "";
+            ? content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+            : typeof content === 'string' ? content : '';
 
           const responseSize = textContent.length;
-          const preview = textContent.length > 100
-            ? textContent.slice(0, 100) + "..."
-            : textContent;
-          logger.dataOut("SDK", `Response received (${responseSize} chars)`, {
-            sessionId: session.sessionDbId,
-            promptNumber: session.lastPromptNumber,
-            model: modelId,
-            preview,
-          });
 
-          // Parse and process response
-          await this.processSDKResponse(session, textContent, modelId, worker);
+          // Only log non-empty responses (filter out noise)
+          if (responseSize > 0) {
+            const truncatedResponse = responseSize > 100
+              ? textContent.substring(0, 100) + '...'
+              : textContent;
+            logger.dataOut('SDK', `Response received (${responseSize} chars)`, {
+              sessionId: session.sessionDbId,
+              promptNumber: session.lastPromptNumber
+            }, truncatedResponse);
+
+            // Parse and process response
+            await this.processSDKResponse(session, textContent, worker);
+          }
         }
 
         // Log result messages
-        if (message.type === "result" && message.subtype === "success") {
+        if (message.type === 'result' && message.subtype === 'success') {
           // Usage telemetry is captured at SDK level
         }
       }
 
       // Mark session complete
       const sessionDuration = Date.now() - session.startTime;
-      logger.success("SDK", "Agent completed", {
+      logger.success('SDK', 'Agent completed', {
         sessionId: session.sessionDbId,
-        duration: `${(sessionDuration / 1000).toFixed(1)}s`,
-        model: modelId,
+        duration: `${(sessionDuration / 1000).toFixed(1)}s`
       });
 
-      this.dbManager
-        .getSessionStore()
-        .markSessionCompleted(session.sessionDbId);
+      this.dbManager.getSessionStore().markSessionCompleted(session.sessionDbId);
+
     } catch (error: any) {
-      if (error.name === "AbortError") {
-        logger.warn("SDK", "Agent aborted", { sessionId: session.sessionDbId });
+      if (error.name === 'AbortError') {
+        logger.warn('SDK', 'Agent aborted', { sessionId: session.sessionDbId });
       } else {
-        logger.failure(
-          "SDK",
-          "Agent error",
-          { sessionDbId: session.sessionDbId },
-          error,
-        );
+        logger.failure('SDK', 'Agent error', { sessionDbId: session.sessionDbId }, error);
       }
       throw error;
     } finally {
@@ -137,67 +115,86 @@ export class SDKAgent {
 
   /**
    * Create event-driven message generator (yields messages from SessionManager)
+   *
+   * CRITICAL: CONTINUATION PROMPT LOGIC
+   * ====================================
+   * This is where NEW hook's dual-purpose nature comes together:
+   *
+   * - Prompt #1 (lastPromptNumber === 1): buildInitPrompt
+   *   - Full initialization prompt with instructions
+   *   - Sets up the SDK agent's context
+   *
+   * - Prompt #2+ (lastPromptNumber > 1): buildContinuationPrompt
+   *   - Continuation prompt for same session
+   *   - Includes session context and prompt number
+   *
+   * BOTH prompts receive session.claudeSessionId:
+   * - This comes from the hook's session_id (see new-hook.ts)
+   * - Same session_id used by SAVE hook to store observations
+   * - This is how everything stays connected in one unified session
+   *
+   * NO SESSION EXISTENCE CHECKS NEEDED:
+   * - SessionManager.initializeSession already fetched this from database
+   * - Database row was created by new-hook's createSDKSession call
+   * - We just use the session_id we're given - simple and reliable
    */
-  private async *createMessageGenerator(
-    session: ActiveSession,
-  ): AsyncIterableIterator<SDKUserMessage> {
-    // Yield initial user prompt with context
+  private async *createMessageGenerator(session: ActiveSession): AsyncIterableIterator<SDKUserMessage> {
+    // Yield initial user prompt with context (or continuation if prompt #2+)
+    // CRITICAL: Both paths use session.claudeSessionId from the hook
     yield {
-      type: "user",
+      type: 'user',
       message: {
-        role: "user",
-        content: buildInitPrompt(
-          session.project,
-          session.claudeSessionId,
-          session.userPrompt,
-        ),
+        role: 'user',
+        content: session.lastPromptNumber === 1
+          ? buildInitPrompt(session.project, session.claudeSessionId, session.userPrompt)
+          : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.claudeSessionId)
       },
       session_id: session.claudeSessionId,
       parent_tool_use_id: null,
-      isSynthetic: true,
+      isSynthetic: true
     };
 
     // Consume pending messages from SessionManager (event-driven, no polling)
-    for await (const message of this.sessionManager.getMessageIterator(
-      session.sessionDbId,
-    )) {
-      if (message.type === "observation") {
+    for await (const message of this.sessionManager.getMessageIterator(session.sessionDbId)) {
+      if (message.type === 'observation') {
         // Update last prompt number
         if (message.prompt_number !== undefined) {
           session.lastPromptNumber = message.prompt_number;
         }
 
         yield {
-          type: "user",
+          type: 'user',
           message: {
-            role: "user",
+            role: 'user',
             content: buildObservationPrompt({
               id: 0, // Not used in prompt
               tool_name: message.tool_name!,
               tool_input: JSON.stringify(message.tool_input),
               tool_output: JSON.stringify(message.tool_response),
               created_at_epoch: Date.now(),
-            }),
+              cwd: message.cwd
+            })
           },
           session_id: session.claudeSessionId,
           parent_tool_use_id: null,
-          isSynthetic: true,
+          isSynthetic: true
         };
-      } else if (message.type === "summarize") {
+      } else if (message.type === 'summarize') {
         yield {
-          type: "user",
+          type: 'user',
           message: {
-            role: "user",
+            role: 'user',
             content: buildSummaryPrompt({
               id: session.sessionDbId,
               sdk_session_id: session.sdkSessionId,
               project: session.project,
               user_prompt: session.userPrompt,
-            }),
+              last_user_message: message.last_user_message || ''
+            })
           },
           session_id: session.claudeSessionId,
           parent_tool_use_id: null,
-          isSynthetic: true,
+          isSynthetic: true
         };
       }
     }
@@ -206,43 +203,64 @@ export class SDKAgent {
   /**
    * Process SDK response text (parse XML, save to database, sync to Chroma)
    */
-  private async processSDKResponse(
-    session: ActiveSession,
-    text: string,
-    modelId: string,
-    worker?: any,
-  ): Promise<void> {
+  private async processSDKResponse(session: ActiveSession, text: string, worker?: any): Promise<void> {
     // Parse observations
     const observations = parseObservations(text, session.claudeSessionId);
 
     // Store observations
     for (const obs of observations) {
-      const { id: obsId, createdAtEpoch } = this.dbManager
-        .getSessionStore()
-        .storeObservation(
-          session.claudeSessionId,
-          session.project,
-          obs,
-          session.lastPromptNumber,
-        );
+      const { id: obsId, createdAtEpoch } = this.dbManager.getSessionStore().storeObservation(
+        session.claudeSessionId,
+        session.project,
+        obs,
+        session.lastPromptNumber
+      );
 
-      // Sync to Chroma (fire-and-forget)
-      this.dbManager
-        .getChromaSync()
-        .syncObservation(
+      // Log observation details
+      logger.info('SDK', 'Observation saved', {
+        sessionId: session.sessionDbId,
+        obsId,
+        type: obs.type,
+        title: obs.title.substring(0, 60) + (obs.title.length > 60 ? '...' : ''),
+        files: obs.files?.length || 0,
+        concepts: obs.concepts?.length || 0
+      });
+
+      // Sync to Chroma with error logging
+      const chromaStart = Date.now();
+      const obsType = obs.type;
+      const obsTitle = obs.title;
+      this.dbManager.getChromaSync().syncObservation(
+        obsId,
+        session.claudeSessionId,
+        session.project,
+        obs,
+        session.lastPromptNumber,
+        createdAtEpoch
+      ).then(() => {
+        const chromaDuration = Date.now() - chromaStart;
+        const truncatedTitle = obsTitle.length > 50
+          ? obsTitle.substring(0, 50) + '...'
+          : obsTitle;
+        logger.debug('CHROMA', 'Observation synced', {
           obsId,
-          session.claudeSessionId,
-          session.project,
-          obs,
-          session.lastPromptNumber,
-          createdAtEpoch,
-        )
-        .catch(() => {});
+          duration: `${chromaDuration}ms`,
+          type: obsType,
+          title: truncatedTitle
+        });
+      }).catch(err => {
+        logger.error('CHROMA', 'Failed to sync observation', {
+          obsId,
+          sessionId: session.sessionDbId,
+          type: obsType,
+          title: obsTitle.substring(0, 50)
+        }, err);
+      });
 
       // Broadcast to SSE clients (for web UI)
       if (worker && worker.sseBroadcaster) {
         worker.sseBroadcaster.broadcast({
-          type: "new_observation",
+          type: 'new_observation',
           observation: {
             id: obsId,
             sdk_session_id: session.sdkSessionId,
@@ -258,16 +276,10 @@ export class SDKAgent {
             files_modified: JSON.stringify([]),
             project: session.project,
             prompt_number: session.lastPromptNumber,
-            created_at_epoch: createdAtEpoch,
-          },
+            created_at_epoch: createdAtEpoch
+          }
         });
       }
-
-      logger.info("SDK", "Observation saved", {
-        obsId,
-        type: obs.type,
-        model: modelId,
-      });
     }
 
     // Parse summary
@@ -275,32 +287,54 @@ export class SDKAgent {
 
     // Store summary
     if (summary) {
-      const { id: summaryId, createdAtEpoch } = this.dbManager
-        .getSessionStore()
-        .storeSummary(
-          session.claudeSessionId,
-          session.project,
-          summary,
-          session.lastPromptNumber,
-        );
+      const { id: summaryId, createdAtEpoch } = this.dbManager.getSessionStore().storeSummary(
+        session.claudeSessionId,
+        session.project,
+        summary,
+        session.lastPromptNumber
+      );
 
-      // Sync to Chroma (fire-and-forget)
-      this.dbManager
-        .getChromaSync()
-        .syncSummary(
+      // Log summary details
+      logger.info('SDK', 'Summary saved', {
+        sessionId: session.sessionDbId,
+        summaryId,
+        request: summary.request.substring(0, 60) + (summary.request.length > 60 ? '...' : ''),
+        hasCompleted: !!summary.completed,
+        hasNextSteps: !!summary.next_steps
+      });
+
+      // Sync to Chroma with error logging
+      const chromaStart = Date.now();
+      const summaryRequest = summary.request;
+      this.dbManager.getChromaSync().syncSummary(
+        summaryId,
+        session.claudeSessionId,
+        session.project,
+        summary,
+        session.lastPromptNumber,
+        createdAtEpoch
+      ).then(() => {
+        const chromaDuration = Date.now() - chromaStart;
+        const truncatedRequest = summaryRequest.length > 50
+          ? summaryRequest.substring(0, 50) + '...'
+          : summaryRequest;
+        logger.debug('CHROMA', 'Summary synced', {
           summaryId,
-          session.claudeSessionId,
-          session.project,
-          summary,
-          session.lastPromptNumber,
-          createdAtEpoch,
-        )
-        .catch(() => {});
+          duration: `${chromaDuration}ms`,
+          request: truncatedRequest
+        });
+      }).catch(err => {
+        logger.error('CHROMA', 'Failed to sync summary', {
+          summaryId,
+          sessionId: session.sessionDbId,
+          request: summaryRequest.substring(0, 50)
+        }, err);
+      });
 
       // Broadcast to SSE clients (for web UI)
       if (worker && worker.sseBroadcaster) {
         worker.sseBroadcaster.broadcast({
-          type: "new_summary",
+          type: 'new_summary',
           summary: {
             id: summaryId,
             session_id: session.claudeSessionId,
@@ -312,17 +346,15 @@ export class SDKAgent {
             notes: summary.notes,
             project: session.project,
             prompt_number: session.lastPromptNumber,
-            created_at_epoch: createdAtEpoch,
-          },
+            created_at_epoch: createdAtEpoch
+          }
         });
       }
-
-      logger.info("SDK", "Summary saved", { summaryId, model: modelId });
     }
 
-    // Check and stop spinner after processing (debounced)
-    if (worker && typeof worker.checkAndStopSpinner === "function") {
-      worker.checkAndStopSpinner();
+    // Broadcast activity status after processing (queue may have changed)
+    if (worker && typeof worker.broadcastProcessingStatus === 'function') {
+      worker.broadcastProcessingStatus();
     }
   }
 
@@ -334,17 +366,12 @@ export class SDKAgent {
    * Find Claude executable (inline, called once per session)
    */
   private findClaudeExecutable(): string {
-    const claudePath =
-      process.env.CLAUDE_CODE_PATH ||
-      execSync(process.platform === "win32" ? "where claude" : "which claude", {
-        encoding: "utf8",
-      })
-        .trim()
-        .split("\n")[0]
-        .trim();
+    const claudePath = process.env.CLAUDE_CODE_PATH ||
+      execSync(process.platform === 'win32' ? 'where claude' : 'which claude', { encoding: 'utf8' })
+        .trim().split('\n')[0].trim();
 
     if (!claudePath) {
-      throw new Error("Claude executable not found in PATH");
+      throw new Error('Claude executable not found in PATH');
     }
 
     return claudePath;
@@ -355,9 +382,9 @@ export class SDKAgent {
    */
   private getModelId(): string {
     try {
-      const settingsPath = path.join(homedir(), ".claude-mem", "settings.json");
+      const settingsPath = path.join(homedir(), '.claude-mem', 'settings.json');
       if (existsSync(settingsPath)) {
-        const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+        const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
         const modelId = settings.env?.CLAUDE_MEM_MODEL;
         if (modelId) return modelId;
       }
@@ -365,64 +392,6 @@ export class SDKAgent {
       // Fall through to env var or default
     }
 
-    return process.env.CLAUDE_MEM_MODEL || "claude-haiku-4-5";
-  }
-
-  /**
-   * Get SDK environment variables from settings or environment
-   * Preserves PATH and other essential env vars for subprocess
-   */
-  private getSDKEnv(): Record<string, string> {
-    // Start with essential environment variables that subprocess needs
-    const env: Record<string, string> = {
-      PATH: process.env.PATH || "",
-      HOME: process.env.HOME || homedir(),
-      USER: process.env.USER || "",
-      SHELL: process.env.SHELL || "",
-    };
-
-    try {
-      const settingsPath = path.join(homedir(), ".claude-mem", "settings.json");
-      if (existsSync(settingsPath)) {
-        const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-
-        // Read each SDK env var from settings
-        const envKeys = [
-          "ANTHROPIC_AUTH_TOKEN",
-          "ANTHROPIC_BASE_URL",
-          "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-          "ANTHROPIC_DEFAULT_SONNET_MODEL",
-          "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        ];
-
-        for (const key of envKeys) {
-          if (settings.env?.[key]) {
-            env[key] = settings.env[key];
-          }
-        }
-      }
-    } catch {
-      // Fall through to process.env
-    }
-
-    // Fallback to process.env for any missing Anthropic values
-    env.ANTHROPIC_AUTH_TOKEN =
-      env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN || "";
-    env.ANTHROPIC_BASE_URL =
-      env.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL || "";
-    env.ANTHROPIC_DEFAULT_HAIKU_MODEL =
-      env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
-      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
-      "";
-    env.ANTHROPIC_DEFAULT_SONNET_MODEL =
-      env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
-      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
-      "";
-    env.ANTHROPIC_DEFAULT_OPUS_MODEL =
-      env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
-      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
-      "";
-
-    return env;
+    return process.env.CLAUDE_MEM_MODEL || 'claude-haiku-4-5';
   }
 }

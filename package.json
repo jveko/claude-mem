@@ -1,6 +1,6 @@
 {
   "name": "claude-mem",
-  "version": "5.2.2",
+  "version": "5.5.1",
   "description": "Memory compression system for Claude Code - persist context across sessions",
   "keywords": [
     "claude",
@@ -40,6 +40,7 @@
     "worker:stop": "pm2 stop claude-mem-worker",
     "worker:restart": "pm2 restart claude-mem-worker",
     "worker:logs": "pm2 logs claude-mem-worker",
+    "changelog:generate": "node scripts/generate-changelog.js",
     "usage:analyze": "node scripts/analyze-usage.js",
     "usage:today": "node scripts/analyze-usage.js $(date +%Y-%m-%d)"
   },

@@ -17,9 +17,17 @@ export class SessionManager {
   private dbManager: DatabaseManager;
   private sessions: Map<number, ActiveSession> = new Map();
   private sessionQueues: Map<number, EventEmitter> = new Map();
+  private onSessionDeletedCallback?: () => void;
 
   constructor(dbManager: DatabaseManager) {
     this.dbManager = dbManager;
+  }
+
+  /**
+   * Set callback to be called when a session is deleted (for broadcasting status)
+   */
+  setOnSessionDeleted(callback: () => void): void {
+    this.onSessionDeletedCallback = callback;
   }
 
   /**
@@ -45,7 +53,7 @@ export class SessionManager {
       pendingMessages: [],
       abortController: new AbortController(),
       generatorPromise: null,
-      lastPromptNumber: 0,
+      lastPromptNumber: this.dbManager.getSessionStore().getPromptCounter(sessionDbId),
       startTime: Date.now()
     };
 
@@ -55,7 +63,13 @@ export class SessionManager {
     const emitter = new EventEmitter();
     this.sessionQueues.set(sessionDbId, emitter);
 
-    logger.info('WORKER', 'Session initialized', { sessionDbId, project: session.project });
+    logger.info('SESSION', 'Session initialized', {
+      sessionId: sessionDbId,
+      project: session.project,
+      claudeSessionId: session.claudeSessionId,
+      queueDepth: 0,
+      hasGenerator: false
+    });
 
     return session;
   }
@@ -78,21 +92,30 @@ export class SessionManager {
       session = this.initializeSession(sessionDbId);
     }
 
+    const beforeDepth = session.pendingMessages.length;
+
     session.pendingMessages.push({
       type: 'observation',
       tool_name: data.tool_name,
       tool_input: data.tool_input,
       tool_response: data.tool_response,
-      prompt_number: data.prompt_number
+      prompt_number: data.prompt_number,
+      cwd: data.cwd
     });
+
+    const afterDepth = session.pendingMessages.length;
 
     // Notify generator immediately (zero latency)
     const emitter = this.sessionQueues.get(sessionDbId);
     emitter?.emit('message');
 
-    logger.debug('WORKER', 'Observation queued', {
-      sessionDbId,
-      queueLength: session.pendingMessages.length
+    // Format tool name for logging
+    const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
+
+    logger.info('SESSION', `Observation queued (${beforeDepth}→${afterDepth})`, {
+      sessionId: sessionDbId,
+      tool: toolSummary,
+      hasGenerator: !!session.generatorPromise
     });
   }
 
@@ -100,19 +123,29 @@ export class SessionManager {
    * Queue a summarize request (zero-latency notification)
    * Auto-initializes session if not in memory but exists in database
    */
-  queueSummarize(sessionDbId: number): void {
+  queueSummarize(sessionDbId: number, lastUserMessage: string): void {
     // Auto-initialize from database if needed (handles worker restarts)
     let session = this.sessions.get(sessionDbId);
     if (!session) {
       session = this.initializeSession(sessionDbId);
     }
 
-    session.pendingMessages.push({ type: 'summarize' });
+    const beforeDepth = session.pendingMessages.length;
+
+    session.pendingMessages.push({
+      type: 'summarize',
+      last_user_message: lastUserMessage
+    });
+
+    const afterDepth = session.pendingMessages.length;
 
     const emitter = this.sessionQueues.get(sessionDbId);
     emitter?.emit('message');
 
-    logger.debug('WORKER', 'Summarize queued', { sessionDbId });
+    logger.info('SESSION', `Summarize queued (${beforeDepth}→${afterDepth})`, {
+      sessionId: sessionDbId,
+      hasGenerator: !!session.generatorPromise
+    });
   }
 
   /**
@@ -123,6 +156,8 @@ export class SessionManager {
     if (!session) {
       return; // Already deleted
     }
+
+    const sessionDuration = Date.now() - session.startTime;
 
     // Abort the SDK agent
     session.abortController.abort();
@@ -136,7 +171,16 @@ export class SessionManager {
     this.sessions.delete(sessionDbId);
     this.sessionQueues.delete(sessionDbId);
 
-    logger.info('WORKER', 'Session deleted', { sessionDbId });
+    logger.info('SESSION', 'Session deleted', {
+      sessionId: sessionDbId,
+      duration: `${(sessionDuration / 1000).toFixed(1)}s`,
+      project: session.project
+    });
+
+    // Trigger callback to broadcast status update (spinner may need to stop)
+    if (this.onSessionDeletedCallback) {
+      this.onSessionDeletedCallback();
+    }
   }
 
   /**
@@ -161,6 +205,35 @@ export class SessionManager {
    */
   getActiveSessionCount(): number {
     return this.sessions.size;
+  }
+
+  /**
+   * Get total queue depth across all sessions (for activity indicator)
+   */
+  getTotalQueueDepth(): number {
+    let total = 0;
+    for (const session of this.sessions.values()) {
+      total += session.pendingMessages.length;
+    }
+    return total;
+  }
+
+  /**
+   * Check if any session is actively processing (has pending messages OR active generator)
+   * Used for activity indicator to prevent spinner from stopping while SDK is processing
+   */
+  isAnySessionProcessing(): boolean {
+    for (const session of this.sessions.values()) {
+      // Has queued messages waiting to be processed
+      if (session.pendingMessages.length > 0) {
+        return true;
+      }
+      // Has active SDK generator running (processing dequeued messages)
+      if (session.generatorPromise !== null) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -198,6 +271,12 @@ export class SessionManager {
       while (session.pendingMessages.length > 0) {
         const message = session.pendingMessages.shift()!;
         yield message;
+
+        // If we just yielded a summary, that's the end of this batch - stop the iterator
+        if (message.type === 'summarize') {
+          logger.info('SESSION', `Summary yielded - ending generator`, { sessionId: sessionDbId });
+          return;
+        }
       }
     }
   }

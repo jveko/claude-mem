@@ -14,11 +14,13 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import http from 'http';
 import path from 'path';
-import { readFileSync, writeFileSync, statSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, statSync, existsSync, renameSync } from 'fs';
 import { homedir } from 'os';
 import { getPackageRoot } from '../shared/paths.js';
 import { getWorkerPort } from '../shared/worker-utils.js';
 import { logger } from '../utils/logger.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 // Import composed services
 import { DatabaseManager } from './worker/DatabaseManager.js';
@@ -32,6 +34,7 @@ export class WorkerService {
   private app: express.Application;
   private server: http.Server | null = null;
   private startTime: number = Date.now();
+  private mcpClient: Client;
 
   // Composed services
   private dbManager: DatabaseManager;
@@ -40,9 +43,6 @@ export class WorkerService {
   private sdkAgent: SDKAgent;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
-
-  // Processing status tracking for viewer UI spinner
-  private isProcessing: boolean = false;
 
   constructor() {
     this.app = express();
@@ -55,6 +55,16 @@ export class WorkerService {
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
 
+    // Set callback for when sessions are deleted (to update activity indicator)
+    this.sessionManager.setOnSessionDeleted(() => {
+      this.broadcastProcessingStatus();
+    });
+
+    this.mcpClient = new Client({
+      name: 'worker-search-proxy',
+      version: '1.0.0'
+    }, { capabilities: {} });
+
     this.setupMiddleware();
     this.setupRoutes();
   }
@@ -66,10 +76,62 @@ export class WorkerService {
     this.app.use(express.json({ limit: '50mb' }));
     this.app.use(cors());
 
+    // HTTP request/response logging middleware
+    this.app.use((req, res, next) => {
+      // Skip logging for static assets and health checks
+      if (req.path.startsWith('/health') || req.path === '/' || req.path.includes('.')) {
+        return next();
+      }
+
+      const start = Date.now();
+      const requestId = `${req.method}-${Date.now()}`;
+
+      // Log incoming request with body summary
+      const bodySummary = this.summarizeRequestBody(req.method, req.path, req.body);
+      logger.info('HTTP', `→ ${req.method} ${req.path}`, { requestId }, bodySummary);
+
+      // Capture response
+      const originalSend = res.send.bind(res);
+      res.send = function(body: any) {
+        const duration = Date.now() - start;
+        logger.info('HTTP', `← ${res.statusCode} ${req.path}`, { requestId, duration: `${duration}ms` });
+        return originalSend(body);
+      };
+
+      next();
+    });
+
     // Serve static files for web UI (viewer-bundle.js, logos, fonts, etc.)
     const packageRoot = getPackageRoot();
     const uiDir = path.join(packageRoot, 'plugin', 'ui');
     this.app.use(express.static(uiDir));
+  }
+
+  /**
+   * Summarize request body for logging
+   */
+  private summarizeRequestBody(method: string, path: string, body: any): string {
+    if (!body || Object.keys(body).length === 0) return '';
+
+    // Session init
+    if (path.includes('/init')) {
+      return '';
+    }
+
+    // Observations
+    if (path.includes('/observations')) {
+      const toolName = body.tool_name || '?';
+      const toolInput = body.tool_input;
+      const toolSummary = logger.formatTool(toolName, toolInput);
+      return `tool=${toolSummary}`;
+    }
+
+    // Summarize request
+    if (path.includes('/summarize')) {
+      return 'requesting summary';
+    }
+
+    return '';
   }
 
   /**
@@ -100,6 +162,22 @@ export class WorkerService {
     // Settings
     this.app.get('/api/settings', this.handleGetSettings.bind(this));
     this.app.post('/api/settings', this.handleUpdateSettings.bind(this));
+
+    // MCP toggle
+    this.app.get('/api/mcp/status', this.handleGetMcpStatus.bind(this));
+    this.app.post('/api/mcp/toggle', this.handleToggleMcp.bind(this));
+
+    // Search API endpoints (for skill-based search)
+    this.app.get('/api/search/observations', this.handleSearchObservations.bind(this));
+    this.app.get('/api/search/sessions', this.handleSearchSessions.bind(this));
+    this.app.get('/api/search/prompts', this.handleSearchPrompts.bind(this));
+    this.app.get('/api/search/by-concept', this.handleSearchByConcept.bind(this));
+    this.app.get('/api/search/by-file', this.handleSearchByFile.bind(this));
+    this.app.get('/api/search/by-type', this.handleSearchByType.bind(this));
+    this.app.get('/api/context/recent', this.handleGetRecentContext.bind(this));
+    this.app.get('/api/context/timeline', this.handleGetContextTimeline.bind(this));
+    this.app.get('/api/timeline/by-query', this.handleGetTimelineByQuery.bind(this));
+    this.app.get('/api/search/help', this.handleSearchHelp.bind(this));
   }
 
   /**
@@ -108,6 +186,17 @@ export class WorkerService {
   async start(): Promise<void> {
     // Initialize database (once, stays open)
     await this.dbManager.initialize();
+
+    // Connect to MCP search server
+    const searchServerPath = path.join(__dirname, '..', '..', 'plugin', 'scripts', 'search-server.mjs');
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [searchServerPath],
+      env: process.env
+    });
+
+    await this.mcpClient.connect(transport);
+    logger.success('WORKER', 'Connected to MCP search server');
 
     // Start HTTP server
     const port = getWorkerPort();
@@ -186,10 +275,11 @@ export class WorkerService {
       timestamp: Date.now()
     });
 
-    // Send initial processing status
+    // Send initial processing status (based on queue depth + active generators)
+    const isProcessing = this.sessionManager.isAnySessionProcessing();
     this.sseBroadcaster.broadcast({
       type: 'processing_status',
-      isProcessing: this.isProcessing
+      isProcessing
     });
   }
 
@@ -229,26 +319,61 @@ export class WorkerService {
           }
         });
 
-        // Sync user prompt to Chroma (fire-and-forget)
+        // Start activity indicator immediately when prompt arrives (work is about to begin)
+        this.sseBroadcaster.broadcast({
+          type: 'processing_status',
+          isProcessing: true
+        });
+
+        // Sync user prompt to Chroma with error logging
+        const chromaStart = Date.now();
+        const promptText = latestPrompt.prompt_text;
         this.dbManager.getChromaSync().syncUserPrompt(
           latestPrompt.id,
           latestPrompt.sdk_session_id,
           latestPrompt.project,
-          latestPrompt.prompt_text,
+          promptText,
           latestPrompt.prompt_number,
           latestPrompt.created_at_epoch
-        ).catch(err => {
-          logger.error('WORKER', 'Failed to sync user_prompt to Chroma', { promptId: latestPrompt.id }, err);
+        ).then(() => {
+          const chromaDuration = Date.now() - chromaStart;
+          const truncatedPrompt = promptText.length > 60
+            ? promptText.substring(0, 60) + '...'
+            : promptText;
+          logger.debug('CHROMA', 'User prompt synced', {
+            promptId: latestPrompt.id,
+            duration: `${chromaDuration}ms`,
+            prompt: truncatedPrompt
+          });
+        }).catch(err => {
+          logger.error('CHROMA', 'Failed to sync user_prompt', {
+            promptId: latestPrompt.id,
+            sessionId: sessionDbId
+          }, err);
         });
       }
 
-      // Start processing indicator
-      this.broadcastProcessingStatus(true);
+      // Broadcast processing status (based on queue depth)
+      this.broadcastProcessingStatus();
 
       // Start SDK agent in background (pass worker ref for spinner control)
-      this.sdkAgent.startSession(session, this).catch(err => {
-        logger.failure('WORKER', 'SDK agent error', { sessionId: sessionDbId }, err);
+      logger.info('SESSION', 'Generator starting', {
+        sessionId: sessionDbId,
+        project: session.project,
+        promptNum: session.lastPromptNumber
       });
+
+      session.generatorPromise = this.sdkAgent.startSession(session, this)
+        .catch(err => {
+          logger.failure('SDK', 'SDK agent error', { sessionId: sessionDbId }, err);
+        })
+        .finally(() => {
+          // Clear generator reference when completed
+          logger.info('SESSION', `Generator finished`, { sessionId: sessionDbId });
+          session.generatorPromise = null;
+          // Broadcast status change (generator finished, may stop spinner)
+          this.broadcastProcessingStatus();
+        });
 
       // Broadcast SSE event
       this.sseBroadcaster.broadcast({
@@ -271,22 +396,39 @@ export class WorkerService {
   private handleObservations(req: Request, res: Response): void {
     try {
       const sessionDbId = parseInt(req.params.sessionDbId, 10);
-      const { tool_name, tool_input, tool_response, prompt_number } = req.body;
+      const { tool_name, tool_input, tool_response, prompt_number, cwd } = req.body;
 
       this.sessionManager.queueObservation(sessionDbId, {
         tool_name,
         tool_input,
         tool_response,
-        prompt_number
+        prompt_number,
+        cwd
       });
 
       // CRITICAL: Ensure SDK agent is running to consume the queue
       const session = this.sessionManager.getSession(sessionDbId);
       if (session && !session.generatorPromise) {
-        session.generatorPromise = this.sdkAgent.startSession(session, this).catch(err => {
-          logger.failure('WORKER', 'SDK agent error', { sessionId: sessionDbId }, err);
+        logger.info('SESSION', 'Generator auto-starting (observation)', {
+          sessionId: sessionDbId,
+          queueDepth: session.pendingMessages.length
         });
+
+        session.generatorPromise = this.sdkAgent.startSession(session, this)
+          .catch(err => {
+            logger.failure('SDK', 'SDK agent error', { sessionId: sessionDbId }, err);
+          })
+          .finally(() => {
+            // Clear generator reference when completed
+            logger.info('SESSION', `Generator finished`, { sessionId: sessionDbId });
+            session.generatorPromise = null;
+            // Broadcast status change (generator finished, may stop spinner)
+            this.broadcastProcessingStatus();
+          });
       }
+
+      // Broadcast activity status (queue depth changed)
+      this.broadcastProcessingStatus();
 
       // Broadcast SSE event
       this.sseBroadcaster.broadcast({
@@ -308,15 +450,33 @@ export class WorkerService {
   private handleSummarize(req: Request, res: Response): void {
     try {
       const sessionDbId = parseInt(req.params.sessionDbId, 10);
-      this.sessionManager.queueSummarize(sessionDbId);
+      const { last_user_message } = req.body;
+
+      this.sessionManager.queueSummarize(sessionDbId, last_user_message);
 
       // CRITICAL: Ensure SDK agent is running to consume the queue
       const session = this.sessionManager.getSession(sessionDbId);
       if (session && !session.generatorPromise) {
-        session.generatorPromise = this.sdkAgent.startSession(session, this).catch(err => {
-          logger.failure('WORKER', 'SDK agent error', { sessionId: sessionDbId }, err);
+        logger.info('SESSION', 'Generator auto-starting (summarize)', {
+          sessionId: sessionDbId,
+          queueDepth: session.pendingMessages.length
         });
+
+        session.generatorPromise = this.sdkAgent.startSession(session, this)
+          .catch(err => {
+            logger.failure('SDK', 'SDK agent error', { sessionId: sessionDbId }, err);
+          })
+          .finally(() => {
+            // Clear generator reference when completed
+            logger.info('SESSION', `Generator finished`, { sessionId: sessionDbId });
+            session.generatorPromise = null;
+            // Broadcast status change (generator finished, may stop spinner)
+            this.broadcastProcessingStatus();
+          });
       }
+
+      // Broadcast activity status (queue depth changed)
+      this.broadcastProcessingStatus();
 
       res.json({ status: 'queued' });
     } catch (error) {
@@ -392,8 +552,8 @@ export class WorkerService {
       // Mark session complete in database
       this.dbManager.markSessionComplete(sessionDbId);
 
-      // Stop processing indicator
-      this.broadcastProcessingStatus(false);
+      // Broadcast processing status (based on queue depth)
+      this.broadcastProcessingStatus();
 
       // Broadcast SSE event
       this.sseBroadcaster.broadcast({
@@ -603,7 +763,8 @@ export class WorkerService {
    * Get processing status (for viewer UI spinner)
    */
   private handleGetProcessingStatus(req: Request, res: Response): void {
-    res.json({ isProcessing: this.isProcessing });
+    const isProcessing = this.sessionManager.isAnySessionProcessing();
+    res.json({ isProcessing });
   }
 
   // ============================================================================
@@ -612,9 +773,19 @@ export class WorkerService {
 
   /**
    * Broadcast processing status change to SSE clients
+   * Checks both queue depth and active generators to prevent premature spinner stop
    */
-  broadcastProcessingStatus(isProcessing: boolean): void {
-    this.isProcessing = isProcessing;
+  broadcastProcessingStatus(): void {
+    const isProcessing = this.sessionManager.isAnySessionProcessing();
+    const queueDepth = this.sessionManager.getTotalQueueDepth();
+    const activeSessions = this.sessionManager.getActiveSessionCount();
+
+    logger.info('WORKER', 'Broadcasting processing status', {
+      isProcessing,
+      queueDepth,
+      activeSessions
+    });
+
     this.sseBroadcaster.broadcast({
       type: 'processing_status',
       isProcessing
@@ -623,24 +794,378 @@ export class WorkerService {
 
   /**
    * Set processing status (called by hooks)
+   * NOTE: This now broadcasts computed status based on active processing (ignores input)
    */
   private handleSetProcessing(req: Request, res: Response): void {
     try {
-      const { isProcessing } = req.body;
+      // Broadcast current computed status (ignores manual input)
+      this.broadcastProcessingStatus();
 
-      if (typeof isProcessing !== 'boolean') {
-        res.status(400).json({ error: 'isProcessing must be a boolean' });
-        return;
-      }
-
-      this.broadcastProcessingStatus(isProcessing);
-      logger.debug('WORKER', 'Processing status updated', { isProcessing });
+      const isProcessing = this.sessionManager.isAnySessionProcessing();
+      const queueDepth = this.sessionManager.getTotalQueueDepth();
+      const activeSessions = this.sessionManager.getActiveSessionCount();
+      logger.debug('WORKER', 'Processing status broadcast', { isProcessing, queueDepth, activeSessions });
 
       res.json({ status: 'ok', isProcessing });
     } catch (error) {
-      logger.failure('WORKER', 'Failed to set processing status', {}, error as Error);
+      logger.failure('WORKER', 'Failed to broadcast processing status', {}, error as Error);
       res.status(500).json({ error: (error as Error).message });
     }
+  }
+
+  // ============================================================================
+  // MCP Toggle Handlers
+  // ============================================================================
+
+  /**
+   * GET /api/mcp/status - Check if MCP search server is enabled
+   */
+  private handleGetMcpStatus(req: Request, res: Response): void {
+    try {
+      const enabled = this.isMcpEnabled();
+      res.json({ enabled });
+    } catch (error) {
+      logger.failure('WORKER', 'Get MCP status failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * POST /api/mcp/toggle - Toggle MCP search server on/off
+   * Body: { enabled: boolean }
+   */
+  private handleToggleMcp(req: Request, res: Response): void {
+    try {
+      const { enabled } = req.body;
+
+      if (typeof enabled !== 'boolean') {
+        res.status(400).json({ error: 'enabled must be a boolean' });
+        return;
+      }
+
+      this.toggleMcp(enabled);
+      res.json({ success: true, enabled: this.isMcpEnabled() });
+    } catch (error) {
+      logger.failure('WORKER', 'Toggle MCP failed', {}, error as Error);
+      res.status(500).json({ success: false, error: (error as Error).message });
+    }
+  }
+
+  // ============================================================================
+  // MCP Toggle Helpers
+  // ============================================================================
+
+  /**
+   * Check if MCP search server is enabled
+   */
+  private isMcpEnabled(): boolean {
+    const packageRoot = getPackageRoot();
+    const mcpPath = path.join(packageRoot, 'plugin', '.mcp.json');
+    return existsSync(mcpPath);
+  }
+
+  /**
+   * Toggle MCP search server (rename .mcp.json <-> .mcp.json.disabled)
+   */
+  private toggleMcp(enabled: boolean): void {
+    try {
+      const packageRoot = getPackageRoot();
+      const mcpPath = path.join(packageRoot, 'plugin', '.mcp.json');
+      const mcpDisabledPath = path.join(packageRoot, 'plugin', '.mcp.json.disabled');
+
+      if (enabled && existsSync(mcpDisabledPath)) {
+        // Enable: rename .mcp.json.disabled -> .mcp.json
+        renameSync(mcpDisabledPath, mcpPath);
+        logger.info('WORKER', 'MCP search server enabled');
+      } else if (!enabled && existsSync(mcpPath)) {
+        // Disable: rename .mcp.json -> .mcp.json.disabled
+        renameSync(mcpPath, mcpDisabledPath);
+        logger.info('WORKER', 'MCP search server disabled');
+      } else {
+        logger.debug('WORKER', 'MCP toggle no-op (already in desired state)', { enabled });
+      }
+    } catch (error) {
+      logger.failure('WORKER', 'Failed to toggle MCP', { enabled }, error as Error);
+      throw error;
+    }
+  }
+
+  // ============================================================================
+  // Search API Handlers (for skill-based search)
+  // ============================================================================
+
+  /**
+   * Search observations
+   * GET /api/search/observations?query=...&format=index&limit=20&project=...
+   */
+  private async handleSearchObservations(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'search_observations',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Search session summaries
+   * GET /api/search/sessions?query=...&format=index&limit=20
+   */
+  private async handleSearchSessions(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'search_sessions',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Search user prompts
+   * GET /api/search/prompts?query=...&format=index&limit=20
+   */
+  private async handleSearchPrompts(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'search_user_prompts',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Search observations by concept
+   * GET /api/search/by-concept?concept=discovery&format=index&limit=5
+   */
+  private async handleSearchByConcept(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'find_by_concept',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Search by file path
+   * GET /api/search/by-file?filePath=...&format=index&limit=10
+   */
+  private async handleSearchByFile(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'find_by_file',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Search observations by type
+   * GET /api/search/by-type?type=bugfix&format=index&limit=10
+   */
+  private async handleSearchByType(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'find_by_type',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Get recent context (summaries and observations for a project)
+   * GET /api/context/recent?project=...&limit=3
+   */
+  private async handleGetRecentContext(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'get_recent_context',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Get context timeline around an anchor point
+   * GET /api/context/timeline?anchor=123&depth_before=10&depth_after=10&project=...
+   */
+  private async handleGetContextTimeline(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'get_context_timeline',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Get timeline by query (search first, then get timeline around best match)
+   * GET /api/timeline/by-query?query=...&mode=auto&depth_before=10&depth_after=10
+   */
+  private async handleGetTimelineByQuery(req: Request, res: Response): Promise<void> {
+    try {
+      const result = await this.mcpClient.callTool({
+        name: 'get_timeline_by_query',
+        arguments: req.query
+      });
+      res.json(result.content);
+    } catch (error) {
+      logger.failure('WORKER', 'Search failed', {}, error as Error);
+      res.status(500).json({ error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Get search help documentation
+   * GET /api/search/help
+   */
+  private handleSearchHelp(req: Request, res: Response): void {
+    res.json({
+      title: 'Claude-Mem Search API',
+      description: 'HTTP API for searching persistent memory',
+      endpoints: [
+        {
+          path: '/api/search/observations',
+          method: 'GET',
+          description: 'Search observations using full-text search',
+          parameters: {
+            query: 'Search query (required)',
+            format: 'Response format: "index" or "full" (default: "full")',
+            limit: 'Number of results (default: 20)',
+            project: 'Filter by project name (optional)'
+          }
+        },
+        {
+          path: '/api/search/sessions',
+          method: 'GET',
+          description: 'Search session summaries using full-text search',
+          parameters: {
+            query: 'Search query (required)',
+            format: 'Response format: "index" or "full" (default: "full")',
+            limit: 'Number of results (default: 20)'
+          }
+        },
+        {
+          path: '/api/search/prompts',
+          method: 'GET',
+          description: 'Search user prompts using full-text search',
+          parameters: {
+            query: 'Search query (required)',
+            format: 'Response format: "index" or "full" (default: "full")',
+            limit: 'Number of results (default: 20)',
+            project: 'Filter by project name (optional)'
+          }
+        },
+        {
+          path: '/api/search/by-concept',
+          method: 'GET',
+          description: 'Find observations by concept tag',
+          parameters: {
+            concept: 'Concept tag (required): discovery, decision, bugfix, feature, refactor',
+            format: 'Response format: "index" or "full" (default: "full")',
+            limit: 'Number of results (default: 10)',
+            project: 'Filter by project name (optional)'
+          }
+        },
+        {
+          path: '/api/search/by-file',
+          method: 'GET',
+          description: 'Find observations and sessions by file path',
+          parameters: {
+            filePath: 'File path or partial path (required)',
+            format: 'Response format: "index" or "full" (default: "full")',
+            limit: 'Number of results per type (default: 10)',
+            project: 'Filter by project name (optional)'
+          }
+        },
+        {
+          path: '/api/search/by-type',
+          method: 'GET',
+          description: 'Find observations by type',
+          parameters: {
+            type: 'Observation type (required): discovery, decision, bugfix, feature, refactor',
+            format: 'Response format: "index" or "full" (default: "full")',
+            limit: 'Number of results (default: 10)',
+            project: 'Filter by project name (optional)'
+          }
+        },
+        {
+          path: '/api/context/recent',
+          method: 'GET',
+          description: 'Get recent session context including summaries and observations',
+          parameters: {
+            project: 'Project name (default: current directory)',
+            limit: 'Number of recent sessions (default: 3)'
+          }
+        },
+        {
+          path: '/api/context/timeline',
+          method: 'GET',
+          description: 'Get unified timeline around a specific point in time',
+          parameters: {
+            anchor: 'Anchor point: observation ID, session ID (e.g., "S123"), or ISO timestamp (required)',
+            depth_before: 'Number of records before anchor (default: 10)',
+            depth_after: 'Number of records after anchor (default: 10)',
+            project: 'Filter by project name (optional)'
+          }
+        },
+        {
+          path: '/api/timeline/by-query',
+          method: 'GET',
+          description: 'Search for best match, then get timeline around it',
+          parameters: {
+            query: 'Search query (required)',
+            mode: 'Search mode: "auto", "observations", or "sessions" (default: "auto")',
+            depth_before: 'Number of records before match (default: 10)',
+            depth_after: 'Number of records after match (default: 10)',
+            project: 'Filter by project name (optional)'
+          }
+        },
+        {
+          path: '/api/search/help',
+          method: 'GET',
+          description: 'Get this help documentation'
+        }
+      ],
+      examples: [
+        'curl "http://localhost:37777/api/search/observations?query=authentication&format=index&limit=5"',
+        'curl "http://localhost:37777/api/search/by-type?type=bugfix&limit=10"',
+        'curl "http://localhost:37777/api/context/recent?project=claude-mem&limit=3"',
+        'curl "http://localhost:37777/api/context/timeline?anchor=123&depth_before=5&depth_after=5"'
+      ]
+    });
   }
 }
 
