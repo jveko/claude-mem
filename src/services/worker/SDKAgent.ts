@@ -86,10 +86,14 @@ export class SDKAgent {
               : "";
 
           const responseSize = textContent.length;
+          const preview = textContent.length > 100
+            ? textContent.slice(0, 100) + "..."
+            : textContent;
           logger.dataOut("SDK", `Response received (${responseSize} chars)`, {
             sessionId: session.sessionDbId,
             promptNumber: session.lastPromptNumber,
             model: modelId,
+            preview,
           });
 
           // Parse and process response
